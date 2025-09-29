@@ -10,8 +10,8 @@ import cv2, numpy as np, onnxruntime as ort
 MODEL_PATH = "plate-yolo-data-384-without-rect-3.onnx"
 
 # Choose source: "rtsp" or "webcam"
-SOURCE      = "webcam"          # "rtsp" | "webcam"
-RTSP_URL    = "rtsp://user:pass@CAMERA_IP:554/Streaming/Channels/102"
+SOURCE      = "rtsp"          # "rtsp" | "webcam"
+RTSP_URL    = "rtsp://admin:admin@192.168.1.201:554/avstream/channel=1/stream=0.sdp"
 WEBCAM_ID   = 0               # /dev/video0
 WEBCAM_SIZE = (640, 480)      # requested capture size
 
@@ -198,29 +198,117 @@ class PlateYOLO6:
 # Frame readers
 # ==========================
 class RTSPReader(threading.Thread):
-    def __init__(self, url, reconnect_delay=1.0):
+    def __init__(self, url, reconnect_delay=1.0, size=(640,360)):
         super().__init__(daemon=True)
         self.url = url
         self.reconnect_delay = reconnect_delay
+        self.size = size
         self.cap = None
         self.latest = None
         self.lock = threading.Lock()
         self.stop_evt = threading.Event()
 
+    # ---- helpers ----
+    @staticmethod
+    def _has_gstreamer():
+        try:
+            info = cv2.getBuildInformation()
+            return "GStreamer" in info and "YES" in info.split("GStreamer")[1].splitlines()[0]
+        except Exception:
+            return False
+
+    def _gst_try_open(self, pipe_desc):
+        cap = cv2.VideoCapture(pipe_desc, cv2.CAP_GSTREAMER)
+        if cap.isOpened():
+            ok, _ = cap.read()
+            if ok:
+                print(f"[INFO] GStreamer OK: {pipe_desc}")
+                return cap
+            cap.release()
+        print(f"[WARN] GStreamer failed: {pipe_desc}")
+        return None
+
+    def _ffmpeg_try_open(self, url, use_tcp=True, bufsize=3):
+        # FFMPEG backend; try forcing TCP (more stable over WAN)
+        url2 = url
+        if use_tcp and ("?" not in url2):
+            url2 = url + "?rtsp_transport=tcp"
+        cap = cv2.VideoCapture(url2, cv2.CAP_FFMPEG)
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, max(1, bufsize))
+            # Some OpenCV builds support timeouts:
+            cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 3000)   # 3s
+            cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 3000)   # 3s
+        except Exception:
+            pass
+        if cap.isOpened():
+            ok, _ = cap.read()
+            if ok:
+                print(f"[INFO] FFMPEG OK ({'TCP' if use_tcp else 'UDP'}): {url2}")
+                return cap
+            cap.release()
+        print(f"[WARN] FFMPEG failed ({'TCP' if use_tcp else 'UDP'}): {url2}")
+        return None
+
     def open(self):
-        if USE_GSTREAMER:
-            w, h = GST_SIZE
-            gst = (
-                f"rtspsrc location={self.url} latency=100 ! "
-                f"rtph264depay ! h264parse ! avdec_h264 ! "
-                f"videoscale ! video/x-raw, width={w}, height={h}, format=BGR ! "
-                f"appsink drop=true sync=false"
-            )
-            cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+        w, h = self.size
+
+        # 1) GStreamer paths (if available)
+        if self._has_gstreamer():
+            print("[INFO] OpenCV reports GStreamer=YES; trying pipelines…")
+
+            # Prefer TCP first (more reliable), then UDP
+            tcp_flag = "protocols=tcp"
+            udp_flag = "protocols=udp"
+
+            # (a) Hardware decode on Pi5 (v4l2h264dec). If H.265, change to v4l2h265dec.
+            pipes = [
+                # TCP, v4l2 decoder
+                (f"rtspsrc location={self.url} {tcp_flag} latency=200 ! "
+                 f"rtpjitterbuffer drop-on-late=true ! rtph264depay ! h264parse ! "
+                 f"v4l2h264dec ! videoconvert ! videoscale ! "
+                 f"video/x-raw, width={w}, height={h}, format=BGR ! "
+                 f"appsink max-buffers=1 drop=true sync=false"),
+
+                # TCP, software decode (avdec_h264)
+                (f"rtspsrc location={self.url} {tcp_flag} latency=200 ! "
+                 f"rtpjitterbuffer drop-on-late=true ! rtph264depay ! h264parse ! "
+                 f"avdec_h264 ! videoconvert ! videoscale ! "
+                 f"video/x-raw, width={w}, height={h}, format=BGR ! "
+                 f"appsink max-buffers=1 drop=true sync=false"),
+
+                # TCP, generic decodebin (lets GStreamer pick)
+                (f"rtspsrc location={self.url} {tcp_flag} latency=200 ! "
+                 f"rtpjitterbuffer drop-on-late=true ! "
+                 f"rtph264depay ! h264parse ! decodebin ! videoconvert ! videoscale ! "
+                 f"video/x-raw, width={w}, height={h}, format=BGR ! "
+                 f"appsink max-buffers=1 drop=true sync=false"),
+
+                # UDP variants (lower latency, less reliable over Wi-Fi)
+                (f"rtspsrc location={self.url} {udp_flag} latency=100 ! "
+                 f"rtpjitterbuffer drop-on-late=true ! rtph264depay ! h264parse ! "
+                 f"avdec_h264 ! videoconvert ! videoscale ! "
+                 f"video/x-raw, width={w}, height={h}, format=BGR ! "
+                 f"appsink max-buffers=1 drop=true sync=false"),
+            ]
+            for p in pipes:
+                cap = self._gst_try_open(p)
+                if cap is not None:
+                    return cap
+            print("[WARN] All GStreamer attempts failed; falling back to FFMPEG…")
         else:
-            cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
-        return cap if cap.isOpened() else None
+            print("[INFO] OpenCV built without GStreamer (or not detected). Using FFMPEG fallback…")
+
+        # 2) FFMPEG fallbacks (TCP then UDP)
+        cap = self._ffmpeg_try_open(self.url, use_tcp=True, bufsize=3)
+        if cap is not None:
+            return cap
+        cap = self._ffmpeg_try_open(self.url, use_tcp=False, bufsize=3)
+        if cap is not None:
+            return cap
+
+        print("[ERROR] Could not open RTSP with GStreamer or FFMPEG.")
+        return None
 
     def run(self):
         while not self.stop_evt.is_set():
@@ -247,6 +335,7 @@ class RTSPReader(threading.Thread):
             if self.cap is not None: self.cap.release()
         except Exception:
             pass
+
 
 class WebcamReader(threading.Thread):
     def __init__(self, cam_id=0, size=(640,480)):
