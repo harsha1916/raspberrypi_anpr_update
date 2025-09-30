@@ -8,7 +8,7 @@ MODEL_PATH   = "plate-yolo-data-384-without-rect-3.onnx"
 
 # Source
 SOURCE       = "rtsp"   # "rtsp" | "webcam"
-RTSP_URL     = "rtsp://admin:admin@192.168.1.201:554/avstream/channel=1/stream=0.sdp"
+RTSP_URL     = "rtsp://admin:admin@192.168.1.201:554/avstream/channel=1/stream=1.sdp"
 USE_GSTREAMER= True
 GST_SIZE     = (640, 360)
 

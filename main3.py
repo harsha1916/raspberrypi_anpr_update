@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
+# Raspberry Pi 5 | Python 3.11.x
 import os, sys, time, signal, threading, collections, re
 from pathlib import Path
 import cv2, numpy as np, onnxruntime as ort
+import pytesseract
 
 # ====== CONFIG ======
 MODEL_PATH   = "plate-yolo-data-384-without-rect-3.onnx"
 
 # Source
 SOURCE       = "rtsp"   # "rtsp" | "webcam"
-RTSP_URL     = "rtsp://admin:admin@192.168.1.201:554/avstream/channel=1/stream=1.sdp"
+RTSP_URL     = "rtsp://admin:admin@192.168.1.201:554/avstream/channel=1/stream=0.sdp"
 USE_GSTREAMER= True
 GST_SIZE     = (640, 360)
 
@@ -17,7 +19,7 @@ WEBCAM_SIZE  = (640, 480)
 
 # UI / Output
 SHOW_WINDOW  = True
-OUTPUT_MP4   = ""   # e.g. "/home/pi5/plates_sort.mp4"
+OUTPUT_MP4   = ""   # e.g. "/home/pi5/plates_sort_tess.mp4"
 TARGET_FPS   = 0
 
 # Detector thresholds
@@ -26,23 +28,23 @@ IOU_THRES    = 0.45
 PAD_VALUE    = 114
 REPLICATE_GRAY_TO_3 = True
 
-# Tracker params (simple IoU tracker)
-TRACKER_MAX_AGE  = 10      # seconds a track can survive without being seen
-TRACKER_MIN_HITS = 3       # hits before a track is considered confirmed
-TRACKER_IOU_THRESH = 0.3
+# SORT params
+SORT_MAX_AGE    = 10
+SORT_MIN_HITS   = 3
+SORT_IOU_THRESH = 0.3
 
-# Async OCR (PaddleOCR)
-USE_PADDLE_OCR  = True
-PADDLE_LANG     = "en"
-PADDLE_THREADS  = 4
-PADDLE_REC_MODEL_DIR = None
+# Async OCR (Tesseract)
+OCR_MAX_FPS            = 3.0    # background OCR rate cap
+OCR_PER_TRACK_COOLDOWN = 0.7    # seconds between OCR calls per track
+OCR_TOPK_TRACKS        = 2      # at most N tracks per frame to submit
+PLATE_STABLE_WINDOW    = 5      # last N reads kept per track
+PLATE_ACCEPT_COUNT     = 2      # votes to accept as stable
 
-# OCR rate limit & stability
-OCR_MAX_FPS           = 3.0      # total OCR rate cap (background thread)
-OCR_PER_TRACK_COOLDOWN= 0.7      # seconds between OCR tries per track
-OCR_TOPK_TRACKS       = 2        # max tracks to submit per frame
-PLATE_STABLE_WINDOW   = 5        # keep last N OCR reads per track
-PLATE_ACCEPT_COUNT    = 2        # require this many matches in window to “lock”
+# Tesseract config (single line, uppercase letters+digits)
+TESSERACT_EXE  = "/usr/bin/tesseract"  # default on Raspberry Pi
+TESSERACT_PSM  = 7   # treat image as a single text line
+TESSERACT_OEM  = 1   # LSTM engine
+TESSERACT_WHITELIST = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 
 DEBUG = False
 def dprint(*a):
@@ -52,7 +54,17 @@ def dprint(*a):
 os.environ.setdefault("OMP_NUM_THREADS", "2")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
 os.environ.setdefault("MKL_NUM_THREADS", "2")
-os.environ["FLAGS_minloglevel"] = "2"
+
+# ====== ensure tesseract path ======
+if Path(TESSERACT_EXE).exists():
+    pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
+
+# ====== SORT import ======
+try:
+    from sort import Sort  # get sort.py from https://github.com/abewley/sort
+except ImportError:
+    print("[ERROR] Could not import 'sort'. Place sort.py from abewley/sort next to this script.")
+    sys.exit(2)
 
 # ====== Utils ======
 def letterbox(img, new_shape, pad_value=114):
@@ -60,7 +72,7 @@ def letterbox(img, new_shape, pad_value=114):
     h, w = img.shape[:2]
     r = min(Ht/h, Wt/w)
     nh, nw = int(round(h*r)), int(round(w*r))
-    im = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    im = cv2.resize(img, (nw, nh), cv2.INTER_LINEAR)
     top = (Ht - nh)//2; bottom = Ht - nh - top
     left = (Wt - nw)//2; right = Wt - nw - left
     if img.ndim == 2:
@@ -150,7 +162,6 @@ class PlateYOLO6:
         xyxy[:,1::2] = np.clip(xyxy[:,1::2], 0, H-1)
         idx = nms(xyxy, scores, IOU_THRES)
         xyxy, scores = xyxy[idx], scores[idx]
-        # return tuples x1,y1,x2,y2,score
         return [(int(a),int(b),int(c),int(d),float(s)) for (a,b,c,d),s in zip(xyxy, scores)]
 
     def infer(self, frame_bgr):
@@ -158,107 +169,7 @@ class PlateYOLO6:
         y = self.sess.run([self.out_name], {self.inp.name: x})[0]
         return self.postprocess(y, frame_bgr.shape)
 
-# ====== Simple IoU-based tracker (replaces SORT) ======
-def iou_xyxy(a, b):
-    # a,b are [x1,y1,x2,y2]
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    ix1 = max(ax1, bx1); iy1 = max(ay1, by1)
-    ix2 = min(ax2, bx2); iy2 = min(ay2, by2)
-    iw = max(0, ix2 - ix1); ih = max(0, iy2 - iy1)
-    inter = iw * ih
-    area_a = max(0, (ax2-ax1)) * max(0, (ay2-ay1))
-    area_b = max(0, (bx2-bx1)) * max(0, (by2-by1))
-    union = area_a + area_b - inter + 1e-9
-    return inter / union if union > 0 else 0.0
-
-class SimpleTracker:
-    def __init__(self, max_age=TRACKER_MAX_AGE, min_hits=TRACKER_MIN_HITS, iou_thresh=TRACKER_IOU_THRESH):
-        self.max_age = float(max_age)
-        self.min_hits = int(min_hits)
-        self.iou_thresh = float(iou_thresh)
-        self.tracks = {}   # id -> {'bbox':(x1,y1,x2,y2), 'last_seen':t, 'hits':int, 'score':float}
-        self._next_id = 1
-        self.lock = threading.Lock()
-
-    def update(self, dets):
-        """
-        dets: ndarray (N,5) or list of (x1,y1,x2,y2,score)
-        returns list of [x1,y1,x2,y2,track_id]
-        """
-        now = time.time()
-        if len(dets) == 0:
-            # age out old tracks
-            to_del = []
-            with self.lock:
-                for tid, t in list(self.tracks.items()):
-                    if (now - t['last_seen']) > self.max_age:
-                        to_del.append(tid)
-                for tid in to_del:
-                    del self.tracks[tid]
-            return []
-
-        arr = np.array(dets, dtype=np.float32)
-        boxes = arr[:, :4].astype(int)
-        scores = arr[:, 4].astype(float)
-
-        with self.lock:
-            track_ids = list(self.tracks.keys())
-            track_boxes = np.array([self.tracks[tid]['bbox'] for tid in track_ids], dtype=np.float32) if track_ids else np.empty((0,4), dtype=np.float32)
-
-            matched_det = set()
-            matched_track = set()
-            assignments = []
-
-            # compute IoU matrix
-            if track_boxes.shape[0] > 0:
-                iou_mat = np.zeros((boxes.shape[0], track_boxes.shape[0]), dtype=np.float32)
-                for i in range(boxes.shape[0]):
-                    for j in range(track_boxes.shape[0]):
-                        iou_mat[i,j] = iou_xyxy(boxes[i], track_boxes[j])
-                # greedy matching by highest IoU
-                flat_idx = np.argsort(-iou_mat.flatten())
-                for idx in flat_idx:
-                    i = idx // iou_mat.shape[1]; j = idx % iou_mat.shape[1]
-                    if i in matched_det or j in matched_track: continue
-                    if iou_mat[i,j] < self.iou_thresh: break
-                    # match det i with track j
-                    tid = track_ids[j]
-                    assignments.append((i, tid))
-                    matched_det.add(i); matched_track.add(j)
-
-            # update matched tracks
-            for i, tid in assignments:
-                x1,y1,x2,y2 = int(boxes[i,0]), int(boxes[i,1]), int(boxes[i,2]), int(boxes[i,3])
-                sc = float(scores[i])
-                t = self.tracks.get(tid)
-                if t:
-                    t['bbox'] = (x1,y1,x2,y2)
-                    t['last_seen'] = now
-                    t['hits'] = t.get('hits',0) + 1
-                    t['score'] = sc
-
-            # create new tracks for unmatched detections
-            for i in range(boxes.shape[0]):
-                if i in matched_det: continue
-                x1,y1,x2,y2 = int(boxes[i,0]), int(boxes[i,1]), int(boxes[i,2]), int(boxes[i,3])
-                sc = float(scores[i])
-                tid = self._next_id; self._next_id += 1
-                self.tracks[tid] = {'bbox':(x1,y1,x2,y2), 'last_seen':now, 'hits':1, 'score':sc}
-
-            # remove aged tracks
-            to_del = [tid for tid,t in self.tracks.items() if (now - t['last_seen']) > self.max_age]
-            for tid in to_del: del self.tracks[tid]
-
-            # create output list: only tracks currently present (those matched or newly created)
-            out = []
-            for tid,t in self.tracks.items():
-                bbox = t['bbox']; hits = t.get('hits',0)
-                # return track even if not yet confirmed — caller can filter by hits if desired
-                out.append([bbox[0], bbox[1], bbox[2], bbox[3], tid, t.get('score',0.0), hits])
-            return out
-
-# ====== Indian plate normalization (same as earlier) ======
+# ====== Indian plate normalization ======
 LETTER_SET = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 DIGIT_SET  = set("0123456789")
 CONFUSION_TO_DIGIT  = {'O':'0','D':'0','Q':'0','I':'1','L':'1','|':'1','!':'1','Z':'2','S':'5','B':'8'}
@@ -295,49 +206,37 @@ def normalize_indian_plate(raw: str) -> str:
         fixed = chars
     return "".join(fixed)
 
-# ====== PaddleOCR (recognizer-only) ======
-if USE_PADDLE_OCR:
-    try:
-        from paddleocr import PaddleOCR
-    except ImportError:
-        print("[ERROR] paddleocr not installed. `pip install paddleocr` (and paddlepaddle) or set USE_PADDLE_OCR=False.")
-        sys.exit(2)
+# ====== Tesseract recognizer ======
+class TesseractRec:
+    def __init__(self, psm=7, oem=1, whitelist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"):
+        self.config = f'--oem {int(oem)} --psm {int(psm)} -c tessedit_char_whitelist={whitelist}'
 
-class PaddleRec:
-    def __init__(self, lang="en", model_dir=None, threads=4):
-        if not USE_PADDLE_OCR:
-            self.ocr = None
-            return
-        self.ocr = PaddleOCR(
-            use_angle_cls=True, lang=lang, det=False, rec=True,
-            rec_model_dir=model_dir, use_gpu=False, cpu_threads=threads, drop_score=0.5
-        )
-        print(f"[INFO] PaddleOCR rec-only: lang={lang} threads={threads}")
-
-    def rec_single(self, roi_bgr):
-        # light enhance
+    def _enhance(self, roi_bgr):
+        # gentle enhance for plates
         g = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
         g = cv2.bilateralFilter(g, 5, 30, 30)
+        # local contrast
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
         g = clahe.apply(g)
-        img = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
-        if not self.ocr: return ""
-        r = self.ocr.ocr(img, det=False, rec=True, cls=True)
-        if not r: return ""
-        first = r[0][0] if isinstance(r[0], (list,tuple)) else ["",0.0]
-        txt = first[0] if isinstance(first, (list,tuple)) and len(first)>0 else ""
-        score = float(first[1]) if isinstance(first, (list,tuple)) and len(first)>1 else 0.0
-        return normalize_indian_plate(txt) if score>=0.25 else ""
+        # light binarization helps tesseract
+        thr = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                    cv2.THRESH_BINARY, 31, 10)
+        return thr
 
-# ====== Async OCR worker keyed by track_id ======
+    def rec_single(self, roi_bgr) -> str:
+        im = self._enhance(roi_bgr)
+        txt = pytesseract.image_to_string(im, config=self.config)
+        return normalize_indian_plate(txt)
+
+# ====== Async OCR keyed by track_id (latest-only) ======
 class AsyncOCR:
     def __init__(self, max_fps=3.0):
-        self.rec = PaddleRec(PADDLE_LANG, PADDLE_REC_MODEL_DIR, threads=PADDLE_THREADS)
+        self.rec = TesseractRec(psm=TESSERACT_PSM, oem=TESSERACT_OEM, whitelist=TESSERACT_WHITELIST)
         self.lock = threading.Lock()
         self.stop_evt = threading.Event()
         self.queue_latest = {}   # track_id -> latest roi
         self.cooldown = {}       # track_id -> last_time
-        self.results = {}        # track_id -> deque of recent texts
+        self.results = {}        # track_id -> deque of texts
         self.min_interval = 1.0/max_fps if max_fps>0 else 0.0
         self._last_cycle = 0.0
         self.worker = threading.Thread(target=self._loop, daemon=True)
@@ -374,20 +273,19 @@ class AsyncOCR:
 
     def get_stable_text(self, track_id):
         dq = self.results.get(track_id)
-        if not dq or len(dq)==0:
-            return "", 0
+        if not dq or len(dq)==0: return "", 0
         counts = {}
         for t in dq:
             if t: counts[t] = counts.get(t,0)+1
         if not counts: return "", 0
         best_txt = max(counts.items(), key=lambda kv: kv[1])[0]
-        return (best_txt, counts[best_txt])
+        return best_txt, counts[best_txt]
 
     def stop(self):
         self.stop_evt.set()
         self.worker.join(timeout=1.0)
 
-# ====== Readers ======
+# ====== Readers (RTSP/Webcam) ======
 class RTSPReader(threading.Thread):
     def __init__(self, url, reconnect_delay=0.6, size=(640,360)):
         super().__init__(daemon=True)
@@ -405,25 +303,21 @@ class RTSPReader(threading.Thread):
     def open(self):
         w,h = self.size
         if USE_GSTREAMER and self._has_gst():
-            pipes = [
-                (f"rtspsrc location={self.url} protocols=tcp latency=200 ! "
-                 f"rtpjitterbuffer drop-on-late=true ! rtph264depay ! h264parse ! "
-                 f"avdec_h264 ! videoconvert ! videoscale ! "
-                 f"video/x-raw, width={w}, height={h}, format=BGR ! "
-                 f"appsink max-buffers=1 drop=true sync=false")
-            ]
-            for p in pipes:
-                cap = cv2.VideoCapture(p, cv2.CAP_GSTREAMER)
-                if cap.isOpened():
-                    ok,_=cap.read()
-                    if ok:
-                        print("[INFO] GStreamer pipeline OK")
-                        return cap
-                if cap: cap.release()
+            gst = (f"rtspsrc location={self.url} protocols=tcp latency=200 ! "
+                   f"rtpjitterbuffer drop-on-late=true ! rtph264depay ! h264parse ! "
+                   f"avdec_h264 ! videoconvert ! videoscale ! "
+                   f"video/x-raw, width={w}, height={h}, format=BGR ! "
+                   f"appsink max-buffers=1 drop=true sync=false")
+            cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+            if cap.isOpened():
+                ok,_=cap.read()
+                if ok:
+                    print("[INFO] GStreamer pipeline OK")
+                    return cap
+                cap.release()
             print("[WARN] GStreamer failed; trying FFMPEG…")
         cap = cv2.VideoCapture(self.url + ("?rtsp_transport=tcp" if "?rtsp_transport" not in self.url else ""), cv2.CAP_FFMPEG)
-        try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
+        try: cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
         except Exception: pass
         if cap.isOpened():
             ok,_=cap.read()
@@ -444,8 +338,7 @@ class RTSPReader(threading.Thread):
             if not ok or frame is None:
                 try: self.cap.release()
                 except Exception: pass
-                self.cap = None
-                time.sleep(self.reconnect_delay); continue
+                self.cap=None; time.sleep(self.reconnect_delay); continue
             with self.lock:
                 self.latest = frame
 
@@ -513,10 +406,10 @@ def main():
         reader = WebcamReader(WEBCAM_ID, WEBCAM_SIZE)
     reader.start()
 
-    # Simple tracker (replaces SORT)
-    tracker = SimpleTracker(max_age=TRACKER_MAX_AGE, min_hits=TRACKER_MIN_HITS, iou_thresh=TRACKER_IOU_THRESH)
+    # SORT tracker
+    tracker = Sort(max_age=SORT_MAX_AGE, min_hits=SORT_MIN_HITS, iou_threshold=SORT_IOU_THRESH)
 
-    # Async OCR worker
+    # Async OCR worker (Tesseract)
     ocrw = AsyncOCR(max_fps=OCR_MAX_FPS)
 
     writer=None
@@ -549,26 +442,22 @@ def main():
             # Detect
             dets = det.infer(frame)  # list of (x1,y1,x2,y2,score)
 
-            # Update tracker with detections
+            # SORT expects [[x1,y1,x2,y2,score], ...]
             sort_in = np.array([[x1,y1,x2,y2,sc] for (x1,y1,x2,y2,sc) in dets], dtype=np.float32) if dets else np.empty((0,5), dtype=np.float32)
-            tracks = tracker.update(sort_in)  # returns list of [x1,y1,x2,y2,tid,score,hits]
+            tracks = tracker.update(sort_in)  # [[x1,y1,x2,y2,track_id], ...]
 
-            # Build a score map for sorting and OCR submission
-            score_map = {(int(x1),int(y1),int(x2),int(y2)):sc for (x1,y1,x2,y2,sc) in dets}
-
-            # Prepare track list (x1,y1,x2,y2,tid,score,hits)
+            # map bbox->score to sort tracks
+            score_map = {(x1,y1,x2,y2):sc for (x1,y1,x2,y2,sc) in dets}
             track_list = []
-            for t in tracks:
-                x1,y1,x2,y2,tid,sc,hits = int(t[0]),int(t[1]),int(t[2]),int(t[3]),int(t[4]),float(t[5]),int(t[6])
-                # try to use fresh detection score if available (matching exact bbox)
-                sc = score_map.get((x1,y1,x2,y2), sc)
-                track_list.append((x1,y1,x2,y2,tid,sc,hits))
-
-            # sort by score*area (largest/most confident first)
+            for x1,y1,x2,y2,tid in tracks:
+                x1=int(x1); y1=int(y1); x2=int(x2); y2=int(y2); tid=int(tid)
+                sc = score_map.get((x1,y1,x2,y2), 0.0)
+                track_list.append((x1,y1,x2,y2,tid,sc))
+            # sort by score*area
             track_list.sort(key=lambda t: ((t[5])*((t[2]-t[0])*(t[3]-t[1]))), reverse=True)
 
-            # Submit limited crops to OCR worker (latest-only per track)
-            for x1,y1,x2,y2,tid,sc,hits in track_list[:OCR_TOPK_TRACKS]:
+            # Submit limited crops to OCR worker (non-blocking, latest-only per track)
+            for x1,y1,x2,y2,tid,sc in track_list[:OCR_TOPK_TRACKS]:
                 px = int(0.03*(x2-x1)); py = int(0.20*(y2-y1))
                 xa, xb = max(0, x1-px), min(W-1, x2+px)
                 ya, yb = max(0, y1-py), min(H-1, y2+py)
@@ -576,20 +465,20 @@ def main():
                 if roi.size>0:
                     ocrw.submit(tid, roi)
 
-            # Draw tracks + stabilized text
-            for x1,y1,x2,y2,tid,sc,hits in track_list:
+            # Draw boxes + stabilized text
+            for x1,y1,x2,y2,tid,sc in track_list:
                 cv2.rectangle(frame,(x1,y1),(x2,y2),(0,255,0),2)
                 text, votes = ocrw.get_stable_text(tid)
                 if text and votes >= PLATE_ACCEPT_COUNT:
                     label = f"ID{tid} {text}"
                     color = (0,200,0)
                 else:
-                    label = f"ID{tid} reading..." if hits < TRACKER_MIN_HITS else f"ID{tid} reading..."
+                    label = f"ID{tid} reading..."
                     color = (0,255,255)
                 cv2.putText(frame, label, (x1, max(0,y1-6)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2, cv2.LINE_AA)
 
-            # FPS
+            # FPS overlay
             frames += 1
             if (time.time()-fps_tick) >= 1.0:
                 fps = frames / (time.time()-fps_tick)
@@ -599,7 +488,7 @@ def main():
 
             if writer is not None: writer.write(frame)
             if SHOW_WINDOW:
-                cv2.imshow("Plates + Tracker + Async OCR", frame)
+                cv2.imshow("Plates + SORT + Async Tesseract", frame)
                 if cv2.waitKey(1) & 0xFF == 27:
                     break
 
